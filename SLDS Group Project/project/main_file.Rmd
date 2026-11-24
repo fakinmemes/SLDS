@@ -1,0 +1,201 @@
+---
+title: "Main Project Notebook"
+output: html_notebook
+params:
+  run_test: false
+---
+## 1.0 Data Processing. The code below helps to turn the downloaded files into a row / region / day in an rds file.
+
+## 1.1. PM2.5 changed from hourly to daily.
+
+```{r}
+library(tidyverse); library(lubridate); library(here)
+
+# Files are long format: one row per region-hour (region, pm25_one_hourly)
+pm_raw <- list.files(here("data_raw", "pm25"), pattern = "\\.csv$", full.names = TRUE) |>
+  map_dfr(~ read_csv(.x, col_types = cols(.default = col_character())))
+
+pm_long <- pm_raw |>
+  transmute(
+    region = region,
+    ts     = with_tz(ymd_hms(timestamp), "Asia/Singapore"),
+    upd    = ymd_hms(update_timestamp),
+    pm25   = as.numeric(pm25_one_hourly)
+  ) |>
+  mutate(date = as_date(ts)) |>
+  arrange(region, ts, desc(upd)) |>
+  distinct(region, ts, .keep_all = TRUE)    # keep the latest update for each hour
+
+pm_daily <- pm_long |>
+  group_by(region, date) |>
+  summarise(n_hours = sum(!is.na(pm25)),
+            pm25 = if_else(n_hours >= 18, mean(pm25, na.rm = TRUE), NA_real_),
+            .groups = "drop")
+```
+
+## 1.2. Fire detection is changed to match GMT +8. Zones are also specified in this code.
+
+```{r}
+haversine_km <- function(lat, lon, lat0 = 1.35, lon0 = 103.82) {
+  r <- pi / 180
+  a <- sin((lat - lat0) * r / 2)^2 +
+       cos(lat0 * r) * cos(lat * r) * sin((lon - lon0) * r / 2)^2
+  6371 * 2 * asin(sqrt(a))
+}
+
+fire <- read_csv(here("data_raw", "firms", "fire_archive_SV-C2_854993.csv"),
+                 col_types = cols(acq_time = col_character(),
+                                  confidence = col_character())) |>
+  filter(confidence != "l", type == 0) |>   # drop low confidence, keep vegetation fires
+  mutate(ts_utc = ymd_hm(paste(acq_date, str_pad(acq_time, 4, pad = "0")), tz = "UTC"),
+         date = as_date(with_tz(ts_utc, "Asia/Singapore")),
+         side = if_else(longitude < 106, "w", "e"),
+         ring = cut(haversine_km(latitude, longitude), c(0, 500, 1000, Inf),
+                    labels = c("near", "mid", "far")),
+         zone = paste(side, ring, sep = "_"))
+
+fire_daily <- fire |>
+  group_by(date, zone) |>
+  summarise(n = n(), frp = sum(frp), .groups = "drop") |>
+  pivot_wider(names_from = zone, values_from = c(n, frp), values_fill = 0) |>
+  complete(date = seq(ymd("2016-12-01"), ymd("2024-12-31"), by = "day")) |>
+  mutate(across(-date, ~ replace_na(.x, 0)))
+```
+
+## 1.3. Weather processing, combines all the CSV files together and makes sure that the data is properly setup.
+
+```{r}
+library(tidyverse); library(janitor); library(lubridate); library(here)
+
+station_region <- c(S24 = "east", S44 = "west", S109 = "north",
+                    S116 = "south", S111 = "central")
+
+files <- list.files(here("data_raw", "mss"),
+                    pattern = "^S\\d+_\\d{6}(\\.csv)?$", full.names = TRUE)
+
+# Sanity check: every station should have 97 monthly files (Dec 2016 - Dec 2024)
+tibble(f = basename(files)) |>
+  mutate(station = str_extract(f, "^S\\d+")) |>
+  count(station)
+
+# Skip failed downloads (empty files or HTML error pages)
+is_mss_csv <- function(f) {
+  file.size(f) > 0 &&
+    str_detect(readLines(f, n = 1, warn = FALSE, encoding = "latin1"), "Station")
+}
+bad <- files[!map_lgl(files, is_mss_csv)]
+message(length(bad), " unusable files: ", paste(basename(bad), collapse = ", "))
+
+read_mss <- function(f) {
+  d <- read_csv(f, col_types = cols(.default = col_character()),
+                locale = locale(encoding = "latin1"),
+                na = c("", "-", "\u2014", "NA")) |>
+    clean_names()
+  pick <- function(pattern) {
+    col <- str_subset(names(d), pattern)[1]
+    if (is.na(col)) rep(NA_character_, nrow(d)) else d[[col]]
+  }
+  tibble(
+    station   = str_extract(basename(f), "^S\\d+"),
+    date      = make_date(as.integer(d$year), as.integer(d$month), as.integer(d$day)),
+    rain      = parse_number(pick("daily_rainfall_total")),
+    temp_mean = parse_number(pick("^mean_temp")),
+    temp_max  = parse_number(pick("^max.*temp")),
+    wind_mean = parse_number(pick("^mean_wind")),
+    wind_max  = parse_number(pick("^max.*wind"))
+  )
+}
+
+weather_raw <- files[map_lgl(files, is_mss_csv)] |> map_dfr(read_mss)
+
+weather_clean <- weather_raw |>
+  distinct(station, date, .keep_all = TRUE) |>
+  mutate(
+    rain      = if_else(between(rain, 0, 300), rain, NA_real_),       # mm/day
+    temp_mean = if_else(between(temp_mean, 20, 35), temp_mean, NA_real_),
+    temp_max  = if_else(between(temp_max, 20, 40), temp_max, NA_real_),
+    wind_mean = if_else(between(wind_mean, 0, 60), wind_mean, NA_real_), # km/h
+    wind_max  = if_else(between(wind_max, 0, 150), wind_max, NA_real_),
+    region    = station_region[station]
+  ) |>
+  filter(!is.na(region), !is.na(date))
+
+# Completeness: share of days present per station-year
+weather_clean |>
+  group_by(station, year = year(date)) |>
+  summarise(across(c(rain, temp_mean, wind_mean), ~ mean(!is.na(.x))), .groups = "drop") |>
+  print(n = Inf)
+
+weather_daily <- weather_clean |>
+  select(region, date, rain, temp_mean, temp_max, wind_mean, wind_max)
+
+# Sensitivity version: island-wide daily average across the five stations
+weather_island <- weather_clean |>
+  group_by(date) |>
+  summarise(across(rain:wind_max, ~ mean(.x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(across(-date, ~ if_else(is.nan(.x), NA_real_, .x)))
+
+saveRDS(weather_daily, here("data_processed", "weather_daily.rds"))
+```
+
+## 1.4. Join the data, add features and merge. We define T_HIGH here.
+
+```{r}
+monsoon <- function(m) case_when(m %in% c(12, 1, 2, 3) ~ "NE", m %in% 6:9 ~ "SW",
+                                 TRUE ~ "inter")
+
+analysis <- pm_daily |>
+  complete(region, date = seq(ymd("2016-12-01"), ymd("2024-12-31"), by = "day")) |>
+  left_join(weather_daily, by = c("region", "date")) |>
+  left_join(fire_daily, by = "date") |>
+  arrange(region, date) |>
+  group_by(region) |>
+  mutate(
+    pm25_next  = lead(pm25, 1),                        # target (day d+1)
+    pm25_lag1  = lag(pm25, 1),
+    pm25_roll3 = slider::slide_dbl(pm25, mean, na.rm = TRUE, .before = 2),
+    across(starts_with(c("n_", "frp_")),
+           list(roll3 = ~ slider::slide_dbl(.x, sum, .before = 2),
+                roll7 = ~ slider::slide_dbl(.x, sum, .before = 6)))
+  ) |>
+  ungroup() |>
+  mutate(pm25_roll3 = if_else(is.nan(pm25_roll3), NA_real_, pm25_roll3),
+         doy_sin = sin(2 * pi * yday(date) / 365.25),
+         doy_cos = cos(2 * pi * yday(date) / 365.25),
+         monsoon = monsoon(month(date)),
+         year    = year(date)) |>
+  filter(year >= 2017, !is.na(pm25_next))
+
+# --- Threshold rule from Step 0, using training years (2017-2023) only ---
+n_high_train <- function(thr) sum(analysis$pm25_next[analysis$year <= 2023] > thr)
+T_HIGH <- if (n_high_train(37.5) >= 50) 37.5 else 25
+message("T_HIGH = ", T_HIGH, " µg/m³ (", n_high_train(T_HIGH),
+        " high region-days in 2017-2023)")
+saveRDS(T_HIGH, here("data_processed", "T_HIGH.rds"))
+
+analysis <- analysis |>
+  mutate(high_next = factor(pm25_next > T_HIGH, levels = c(TRUE, FALSE),
+                            labels = c("high", "normal")))
+
+saveRDS(analysis, here("data_processed", "analysis.rds"))
+```
+
+## 2.0 Exploratory Analysis of 2017-2023 as the training set.
+
+```{r}
+library(tidyverse); library(here)
+train <- readRDS(here("data_processed", "analysis.rds")) |> filter(year <= 2023)
+
+train |>
+  ggplot(aes(date, pm25, colour = region)) +
+  geom_line(alpha = 0.6) +
+  geom_hline(yintercept = T_HIGH, linetype = "dashed") +
+  labs(x = NULL, y = "Daily mean PM2.5 (µg/m³)") +
+  theme_minimal()
+ggsave(here("figures", "fig1_timeseries.png"), width = 8, height = 3.5, dpi = 300)
+
+train |> count(year, region, high_next) |>
+  pivot_wider(names_from = high_next, values_from = n, values_fill = 0)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.

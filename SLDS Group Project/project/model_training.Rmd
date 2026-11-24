@@ -1,0 +1,148 @@
+---
+title: "model_training"
+output: html_document
+params:
+  run_test: false
+---
+
+## 1.0 Cross Validation
+
+```{r}
+library(tidyverse); library(lubridate); library(yardstick); library(here)
+source(here("models.R"))
+
+d   <- prep(readRDS(here("data_processed", "analysis.rds")))
+dev <- filter(d, year <= 2023)
+
+score_models <- function(train, test) {
+  clim <- train |> group_by(wk = week(date)) |> summarise(clim = mean(pm25_next))
+  test |>
+    mutate(wk = week(date)) |>
+    left_join(clim, by = "wk") |>
+    transmute(date, region, truth = high_next, pm25_next,
+              B1 = pm25, B2 = clim,
+              M1 = predict_lasso(fit_lasso(train, FALSE), test),
+              M2 = predict_lasso(fit_lasso(train, TRUE),  test),
+              M3 = predict_rf(fit_rf(train, FALSE), test),
+              M4 = predict_rf(fit_rf(train, TRUE),  test))
+}
+
+cv_preds <- map_dfr(2020:2023, \(v)
+  score_models(filter(dev, year < v), filter(dev, year == v)) |> mutate(fold = v))
+saveRDS(cv_preds, here("data_processed", "cv_preds.rds"))
+```
+
+## 1.1 Metrics
+
+```{r}
+recall_at <- function(truth, score, rate = 0.05) {
+  mean(score[truth == "high"] >= quantile(score, 1 - rate))
+}
+
+cv_long <- cv_preds |> pivot_longer(B1:M4, names_to = "model", values_to = "score")
+
+cv_long |>
+  group_by(model) |>      # pooled over folds; repeat with group_by(model, fold)
+  summarise(roc_auc   = roc_auc_vec(truth, score),
+            pr_auc    = pr_auc_vec(truth, score),
+            recall_5  = recall_at(truth, score),
+            n_high    = sum(truth == "high"))
+```
+
+## 1.3 Uncertainty Measurement
+
+```{r}
+boot_gain <- function(p, without, with, B = 1000) {
+  p <- mutate(p, blk = floor_date(date, "week"))
+  blk_info <- p |> group_by(blk) |> summarise(has_high = any(truth == "high"))
+  hi <- blk_info$blk[blk_info$has_high]
+  lo <- blk_info$blk[!blk_info$has_high]
+
+  gains <- replicate(B, {
+    s <- tibble(blk = c(sample(hi, length(hi), replace = TRUE),
+                        sample(lo, length(lo), replace = TRUE))) |>
+      left_join(p, by = "blk", relationship = "many-to-many")
+    pr_auc_vec(s$truth, s[[with]]) - pr_auc_vec(s$truth, s[[without]])
+  })
+
+  n_na <- sum(is.na(gains))
+  if (n_na > 0) warning(n_na, " of ", B, " draws returned NA")
+  c(quantile(gains, c(0.025, 0.5, 0.975), na.rm = TRUE), n_valid = B - n_na)
+}
+```
+
+```{r}
+count(cv_preds, fold, truth)                 # high days per validation year
+colSums(is.na(select(cv_preds, B1:M4)))      # any missing predictions?
+```
+
+## 1.4 Final test and Analysis
+
+```{r}
+# analysis/40_test.R — run ONCE, after 00_plan.md and tuning settings are committed
+library(tidyverse); library(lubridate); library(yardstick); library(here)
+set.seed(42)
+source(here("models.R"))   # prep(), fit_*(), predict_*(), score_models(), recall_at(), boot_gain()
+
+analysis  <- readRDS(here("data_processed", "analysis.rds"))
+T_HIGH    <- readRDS(here("data_processed", "T_HIGH.rds"))
+fire_vars <- str_subset(names(analysis), "^(n|frp)_")
+
+d    <- prep(analysis)
+dev  <- filter(d, year <= 2023)
+test <- filter(d, year == 2024)
+
+# Guard against accidental reruns
+out_path <- here("data_processed", "test_preds.rds")
+if (file.exists(out_path)) stop("Final test already run: ", out_path,
+                                ". Delete it only if you are documenting a rerun.")
+
+# 1. Fit on 2017-2023, predict 2024
+test_preds <- score_models(dev, test)
+saveRDS(test_preds, out_path)
+
+# 2. Run log for the report
+writeLines(c(paste("Final test run:", Sys.time()),
+             paste("Git commit:", system("git rev-parse --short HEAD", intern = TRUE)),
+             paste("T_HIGH:", T_HIGH),
+             paste("Train rows:", nrow(dev), "| Test rows:", nrow(test)),
+             paste("High days in 2024:", sum(test_preds$truth == "high"))),
+           here("data_processed", "test_run_log.txt"))
+
+# 3. Metrics (same as CV)
+n_high <- sum(test_preds$truth == "high")
+test_long <- test_preds |> pivot_longer(B1:M4, names_to = "model", values_to = "score")
+
+test_metrics <- test_long |>
+  group_by(model) |>
+  summarise(
+    roc_auc  = if (n_high > 0) roc_auc_vec(truth, score) else NA_real_,
+    pr_auc   = if (n_high > 0) pr_auc_vec(truth, score)  else NA_real_,
+    recall_5 = if (n_high > 0) recall_at(truth, score)   else NA_real_,
+    brier    = if (first(model) %in% c("M1", "M2", "M3", "M4"))
+                 brier_class_vec(truth, score) else NA_real_,
+    n_high   = n_high,
+    .groups  = "drop"
+  )
+saveRDS(test_metrics, here("data_processed", "test_metrics.rds"))
+test_metrics
+
+# 4. Fire-gain intervals (only meaningful with enough high days)
+if (n_high >= 10) {
+  test_gains <- list(lasso = boot_gain(test_preds, "M1", "M2"),
+                     rf    = boot_gain(test_preds, "M3", "M4"))
+  saveRDS(test_gains, here("data_processed", "test_gains.rds"))
+  test_gains
+} else {
+  message("Only ", n_high, " high days in 2024: skip the PR-AUC bootstrap, ",
+          "report Brier score and the daily-mean regression result instead.")
+}
+
+# 5. Per-region breakdown for Step 7d
+test_long |>
+  group_by(model, region) |>
+  summarise(n_high = sum(truth == "high"),
+            roc_auc = if (n_high > 0 && n_high < n()) roc_auc_vec(truth, score) else NA_real_,
+            .groups = "drop") |>
+  pivot_wider(names_from = model, values_from = roc_auc)
+```
