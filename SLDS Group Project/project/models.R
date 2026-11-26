@@ -16,12 +16,43 @@ make_X <- function(d, use_fire) {
   model.matrix(~ . - 1, d[, vars])
 }
 
+MIN_POS <- 10   # minimum high days needed to fit a classifier
+
 fit_lasso <- function(d, use_fire) {
   X <- make_X(d, use_fire)
-  cv <- glmnet::cv.glmnet(X, d$high_next == "high", family = "binomial",
-                          alpha = 1, foldid = as.integer(factor(d$year)))  # year-blocked tuning
-  list(cv = cv, use_fire = use_fire)
+  y <- d$high_next == "high"
+  # Year-blocked CV only if every leave-one-year-out subset still has >= 2 positives
+  yr <- as.integer(factor(d$year))
+  ok_blocks <- all(map_lgl(unique(yr), \(k) sum(y[yr != k]) >= 2))
+  cv <- if (ok_blocks) {
+    glmnet::cv.glmnet(X, y, family = "binomial", alpha = 1, foldid = yr)
+  } else {
+    glmnet::cv.glmnet(X, y, family = "binomial", alpha = 1, nfolds = 5)
+  }
+  list(cv = cv, use_fire = use_fire, blocked = ok_blocks)
 }
+
+score_models <- function(train, test) {
+  n_pos <- sum(train$high_next == "high")
+  clim  <- train |> group_by(wk = week(date)) |> summarise(clim = mean(pm25_next))
+  
+  out <- test |>
+    mutate(wk = week(date)) |>
+    left_join(clim, by = "wk") |>
+    transmute(date, region, truth = high_next, pm25_next,
+              B1 = pm25, B2 = coalesce(clim, mean(train$pm25_next)))
+  
+  if (n_pos < MIN_POS) {
+    message("Only ", n_pos, " high days in training: classifiers skipped (NA).")
+    return(mutate(out, M1 = NA_real_, M2 = NA_real_, M3 = NA_real_, M4 = NA_real_))
+  }
+  out |>
+    mutate(M1 = predict_lasso(fit_lasso(train, FALSE), test),
+           M2 = predict_lasso(fit_lasso(train, TRUE),  test),
+           M3 = predict_rf(fit_rf(train, FALSE), test),
+           M4 = predict_rf(fit_rf(train, TRUE),  test))
+}
+
 predict_lasso <- function(m, d) {
   as.numeric(predict(m$cv, make_X(d, m$use_fire), s = "lambda.1se", type = "response"))
 }

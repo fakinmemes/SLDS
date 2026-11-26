@@ -9,28 +9,10 @@ params:
 ## 1.1. PM2.5 changed from hourly to daily.
 
 ```{r}
-library(tidyverse); library(lubridate); library(here)
-
-# Files are long format: one row per region-hour (region, pm25_one_hourly)
-pm_raw <- list.files(here("data_raw", "pm25"), pattern = "\\.csv$", full.names = TRUE) |>
-  map_dfr(~ read_csv(.x, col_types = cols(.default = col_character())))
-
-pm_long <- pm_raw |>
-  transmute(
-    region = region,
-    ts     = with_tz(ymd_hms(timestamp), "Asia/Singapore"),
-    upd    = ymd_hms(update_timestamp),
-    pm25   = as.numeric(pm25_one_hourly)
-  ) |>
-  mutate(date = as_date(ts)) |>
-  arrange(region, ts, desc(upd)) |>
-  distinct(region, ts, .keep_all = TRUE)    # keep the latest update for each hour
-
-pm_daily <- pm_long |>
-  group_by(region, date) |>
-  summarise(n_hours = sum(!is.na(pm25)),
-            pm25 = if_else(n_hours >= 18, mean(pm25, na.rm = TRUE), NA_real_),
-            .groups = "drop")
+source(here("rebuild_data.R"))
+pm_long  <- build_pm_long(here("data_raw", "pm25"))
+saveRDS(pm_long, here("data_processed", "pm_long.rds"))
+pm_daily <- build_pm_daily(pm_long, min_hours = 18)
 ```
 
 ## 1.2. Fire detection is changed to match GMT +8. Zones are also specified in this code.

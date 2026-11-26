@@ -1,0 +1,5 @@
+Final test run: 2026-11-24 16:14:26.437676
+Git commit: dd0c5de
+T_HIGH: 37.5
+Train rows: 10880 | Test rows: 1632
+High days in 2024: 0

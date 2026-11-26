@@ -146,3 +146,416 @@ test_long |>
             .groups = "drop") |>
   pivot_wider(names_from = model, values_from = roc_auc)
 ```
+```{r}
+T_HIGH
+test |> summarise(n = n(), max_pm = max(pm25_next), p99 = quantile(pm25_next, 0.99))
+count(test, region)                    # ~366 rows per region expected
+analysis |> filter(year == 2024) |> summarise(missing = sum(is.na(pm25_next)))
+```
+
+## 1.5 Continuous Outcome Test
+
+```{r}
+fit_reg <- function(d, use_fire, kind = c("lasso", "rf")) {
+  kind <- match.arg(kind)
+  vars <- c(base_vars, if (use_fire) fire_vars)
+  if (kind == "lasso") {
+    X <- model.matrix(~ . - 1, d[, vars])
+    list(kind = kind, use_fire = use_fire,
+         m = glmnet::cv.glmnet(X, log(d$pm25_next), alpha = 1,
+                               foldid = as.integer(factor(d$year))))
+  } else {
+    list(kind = kind, use_fire = use_fire,
+         m = ranger::ranger(x = d[, vars], y = log(d$pm25_next),
+                            num.trees = 500, seed = 42))
+  }
+}
+predict_reg <- function(f, d) {
+  vars <- c(base_vars, if (f$use_fire) fire_vars)
+  p <- if (f$kind == "lasso")
+    predict(f$m, model.matrix(~ . - 1, d[, vars]), s = "lambda.1se")[, 1]
+  else predict(f$m, d[, vars])$predictions
+  exp(p)
+}
+
+score_reg <- function(train, test) {
+  clim <- train |> group_by(wk = week(date)) |> summarise(clim = mean(pm25_next))
+  test |>
+    mutate(wk = week(date)) |>
+    left_join(clim, by = "wk") |>
+    transmute(date, region, year, truth = pm25_next,
+              B1 = pm25, B2 = coalesce(clim, mean(train$pm25_next)),
+              M1 = predict_reg(fit_reg(train, FALSE, "lasso"), test),
+              M2 = predict_reg(fit_reg(train, TRUE,  "lasso"), test),
+              M3 = predict_reg(fit_reg(train, FALSE, "rf"),    test),
+              M4 = predict_reg(fit_reg(train, TRUE,  "rf"),    test))
+}
+
+reg_cv <- map_dfr(2020:2023, \(v) score_reg(filter(dev, year < v), filter(dev, year == v)))
+reg_test <- score_reg(dev, test)   # once, after the CV version is settled
+
+mae_table <- function(p) p |>
+  pivot_longer(B1:M4, names_to = "model", values_to = "pred") |>
+  group_by(model) |>
+  summarise(MAE = mean(abs(pred - truth)), .groups = "drop")
+mae_table(reg_cv); mae_table(reg_test)
+```
+
+## 1.6 False Alarm check in the Test Set
+
+```{r}
+library(tidyverse); library(lubridate); library(here)
+
+cv_preds   <- readRDS(here("data_processed", "cv_preds.rds"))
+test_preds <- readRDS(here("data_processed", "test_preds.rds"))
+models <- c("B1", "B2", "M1", "M2", "M3", "M4")
+
+# 1. Alert cut-offs from CV only: each model's top 5% of risk scores in 2020-2023
+cutoffs <- cv_preds |>
+  pivot_longer(all_of(models), names_to = "model", values_to = "score") |>
+  group_by(model) |>
+  summarise(cutoff = quantile(score, 0.95, na.rm = TRUE),
+            cv_recall = mean(score[truth == "high"] >= cutoff),   # what the cut-off catches in CV
+            .groups = "drop")
+saveRDS(cutoffs, here("data_processed", "alert_cutoffs.rds"))
+
+# 2. Apply the fixed cut-offs to 2024
+alerts <- test_preds |>
+  pivot_longer(all_of(models), names_to = "model", values_to = "score") |>
+  left_join(cutoffs, by = "model") |>
+  mutate(alert = score >= cutoff)
+
+# 3. Summary: false-alarm rate in a calm year (all alerts are false here)
+false_alarms <- alerts |>
+  group_by(model) |>
+  summarise(region_days      = n(),
+            alerts           = sum(alert),
+            false_alarm_rate = mean(alert),            # compare with the 5% CV alert rate
+            alert_dates      = n_distinct(date[alert]),# days with >=1 region alerting
+            cv_recall        = first(cv_recall),
+            .groups = "drop")
+saveRDS(false_alarms, here("data_processed", "false_alarms_2024.rds"))
+knitr::kable(false_alarms, digits = 3)
+
+# 4. Longest run of consecutive alert days (a multi-day false haze warning is costly)
+alerts |>
+  arrange(model, region, date) |>
+  group_by(model, region) |>
+  mutate(run_id = cumsum(!alert)) |>
+  filter(alert) |>
+  count(model, region, run_id, name = "run_len") |>
+  group_by(model) |>
+  summarise(longest_run = max(run_len), .groups = "drop")
+
+# 5. When did alerts happen, and how high was PM2.5 on those days?
+alerts |>
+  filter(alert, model %in% c("M2", "M4")) |>
+  select(model, date, region, score, cutoff, truth_pm25 = pm25_next) |>
+  arrange(model, desc(score)) |>
+  print(n = 20)
+
+# 6. Figure: 2024 risk for the fire models against their fixed cut-offs
+alerts |>
+  filter(model %in% c("M1", "M2", "M3", "M4")) |>
+  ggplot(aes(date, score, colour = region)) +
+  geom_line(alpha = 0.5) +
+  geom_hline(aes(yintercept = cutoff), linetype = "dashed") +
+  facet_wrap(~ model, ncol = 2) +
+  labs(x = NULL, y = "Predicted probability of a high-PM2.5 day",
+       title = "2024 risk scores vs alert cut-off fixed from 2020–2023 CV") +
+  theme_minimal()
+ggsave(here("figures", "fig_false_alarms_2024.png"), width = 9, height = 5, dpi = 300)
+```
+
+## 2.0 Calibration, Model Interpretation and Regression Residuals
+
+```{r}
+# analysis/50_diagnostics — Step 7a
+library(tidyverse); library(lubridate); library(yardstick); library(here)
+set.seed(42)
+source(here("models.R"))
+
+analysis  <- readRDS(here("data_processed", "analysis.rds"))
+fire_vars <- str_subset(names(analysis), "^(n|frp)_")
+d   <- prep(analysis)
+dev <- filter(d, year <= 2023)
+cv_preds <- readRDS(here("data_processed", "cv_preds.rds"))
+
+monsoon <- function(m) case_when(m %in% c(12, 1, 2, 3) ~ "NE", m %in% 6:9 ~ "SW",
+                                 TRUE ~ "inter")
+
+# ---------------------------------------------------------------
+# 1. Calibration (CV predictions, 2020-2023)
+# ---------------------------------------------------------------
+cal_long <- cv_preds |>
+  pivot_longer(c(M1, M2, M3, M4), names_to = "model", values_to = "p") |>
+  mutate(y = as.integer(truth == "high"))
+
+# Brier score per model
+cal_long |>
+  group_by(model) |>
+  summarise(brier = mean((p - y)^2), n_high = sum(y), .groups = "drop")
+
+# Binned reliability table. Fixed bins on a log-ish scale, because most
+# predictions are near zero and high days are rare
+cal_tab <- cal_long |>
+  mutate(bin = cut(p, c(0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1), include.lowest = TRUE)) |>
+  group_by(model, bin) |>
+  summarise(n = n(), mean_pred = mean(p), obs_rate = mean(y),
+            se = sqrt(obs_rate * (1 - obs_rate) / n), .groups = "drop")
+knitr::kable(cal_tab, digits = 3)
+
+ggplot(cal_tab, aes(mean_pred, obs_rate)) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(ymin = pmax(obs_rate - 1.96 * se, 0),
+                      ymax = pmin(obs_rate + 1.96 * se, 1), size = n),
+                  fatten = 1.5, show.legend = FALSE) +
+  facet_wrap(~ model) +
+  labs(x = "Mean predicted probability (bin)", y = "Observed share of high days",
+       title = "Calibration on 2020–2023 cross-validation predictions") +
+  theme_minimal()
+ggsave(here("figures", "fig_calibration.png"), width = 8, height = 6, dpi = 300)
+
+# ---------------------------------------------------------------
+# 2. Interpretation: refit M2 and M4 on all of 2017-2023
+# ---------------------------------------------------------------
+m2 <- fit_lasso(dev, use_fire = TRUE)
+m4 <- fit_rf(dev, use_fire = TRUE)
+
+# Lasso: non-zero coefficients (inputs are standardised internally,
+# but coef() returns them on the original scale)
+lasso_coef <- coef(m2$cv, s = "lambda.1se") |>
+  as.matrix() |> as.data.frame() |>
+  rownames_to_column("term") |>
+  rename(estimate = 2) |>
+  filter(estimate != 0, term != "(Intercept)") |>
+  mutate(fire = str_detect(term, "^(n|frp)_")) |>
+  arrange(desc(abs(estimate)))
+knitr::kable(lasso_coef, digits = 4)
+message(sum(lasso_coef$fire), " fire features kept by the lasso out of ", length(fire_vars))
+
+# Random forest: permutation importance
+rf_imp <- tibble(term = names(m4$variable.importance),
+                 importance = m4$variable.importance) |>
+  mutate(fire = str_detect(term, "^(n|frp)_")) |>
+  slice_max(importance, n = 15)
+
+ggplot(rf_imp, aes(importance, fct_reorder(term, importance), fill = fire)) +
+  geom_col() +
+  scale_fill_manual(values = c(`TRUE` = "#d95f02", `FALSE` = "grey60"),
+                    labels = c("Other", "Fire feature"), name = NULL) +
+  labs(x = "Permutation importance", y = NULL,
+       title = "M4 random forest: top 15 predictors (fit on 2017–2023)") +
+  theme_minimal()
+ggsave(here("figures", "fig_rf_importance.png"), width = 7, height = 5, dpi = 300)
+
+# ---------------------------------------------------------------
+# 3. Regression residuals (secondary outcome, CV 2020-2023)
+# ---------------------------------------------------------------
+reg_long <- reg_cv |>
+  pivot_longer(B1:M4, names_to = "model", values_to = "pred") |>
+  mutate(resid = truth - pred,                 # µg/m³; positive = under-prediction
+         monsoon = monsoon(month(date)))
+
+# Residuals vs fitted (M2, M4)
+reg_long |>
+  filter(model %in% c("M2", "M4")) |>
+  ggplot(aes(pred, resid)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(alpha = 0.15, size = 0.6) +
+  geom_smooth(se = FALSE, method = "loess", colour = "#d95f02") +
+  facet_wrap(~ model) +
+  labs(x = "Predicted next-day PM2.5 (µg/m³)", y = "Residual (µg/m³)") +
+  theme_minimal()
+ggsave(here("figures", "fig_resid_fitted.png"), width = 8, height = 3.5, dpi = 300)
+
+# Residuals over time (look for runs of under-prediction = missed episodes)
+reg_long |>
+  filter(model %in% c("M1", "M2")) |>
+  group_by(model, date) |>
+  summarise(resid = mean(resid), .groups = "drop") |>
+  ggplot(aes(date, resid, colour = model)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(alpha = 0.7) +
+  labs(x = NULL, y = "Mean residual across regions (µg/m³)") +
+  theme_minimal()
+ggsave(here("figures", "fig_resid_time.png"), width = 9, height = 3.5, dpi = 300)
+
+# MAE by region and by monsoon season
+mae_region <- reg_long |>
+  group_by(model, region) |>
+  summarise(MAE = mean(abs(resid)), .groups = "drop") |>
+  pivot_wider(names_from = model, values_from = MAE)
+
+mae_monsoon <- reg_long |>
+  group_by(model, monsoon) |>
+  summarise(MAE = mean(abs(resid)), n = n(), .groups = "drop") |>
+  pivot_wider(names_from = model, values_from = MAE)
+
+knitr::kable(mae_region, digits = 2)
+knitr::kable(mae_monsoon, digits = 2)
+```
+
+## 2.1 Haze Onset Decisive Failure Case
+
+```{r}
+onsets <- cv_preds |>
+  arrange(region, date) |>
+  group_by(region) |>
+  mutate(onset = truth == "high" & lag(truth) == "normal") |>
+  ungroup()
+
+onsets |>
+  pivot_longer(B1:M4, names_to = "model", values_to = "score") |>
+  group_by(model) |>
+  mutate(alert = score >= quantile(score, 0.95)) |>
+  filter(onset) |>
+  summarise(n_onsets = n(), onset_recall = mean(alert))
+```
+
+## 2.2 Sensitivity Check
+
+```{r}
+# analysis/60_sensitivity
+library(tidyverse); library(lubridate); library(yardstick); library(here)
+set.seed(42)
+source(here("models.R"))
+source(here("rebuild_data.R"))
+
+pm_long       <- readRDS(here("data_processed", "pm_long.rds"))
+weather_daily <- readRDS(here("data_processed", "weather_daily.rds"))
+T_HIGH        <- readRDS(here("data_processed", "T_HIGH.rds"))
+T_ALT         <- if (T_HIGH == 37.5) 25 else 37.5
+viirs_path    <- here("data_raw", "firms", "fire_archive_SV-C2_854993.csv")
+modis_path    <- here("data_raw", "firms", "fire_archive_M-C61_854992.csv")      # adjust file names
+
+pm_main   <- build_pm_daily(pm_long, 18)
+fire_main <- build_fire_daily(viirs_path, "viirs")
+
+cached <- function(name, expr) {
+  path <- here("data_processed", "sens", paste0(name, ".rds"))
+  dir.create(dirname(path), showWarnings = FALSE)
+  if (file.exists(path)) return(readRDS(path))
+  out <- expr; saveRDS(out, path); out
+}
+
+# Run CV for one variant; fire_vars is a global used by models.R
+run_cv <- function(analysis, train_years = 2017:2023, val_years = 2020:2023) {
+  fire_vars <<- str_subset(names(analysis), "^(n|frp)_")
+  d <- prep(analysis) |> filter(year %in% train_years)
+  cls <- map_dfr(val_years, \(v) score_models(filter(d, year < v), filter(d, year == v)))
+  reg <- map_dfr(val_years, \(v) score_reg(filter(d, year < v), filter(d, year == v)))
+  summarise_variant(cls, reg)
+}
+
+summarise_variant <- function(cls, reg) {
+  n_high <- sum(cls$truth == "high")
+
+  c_tab <- cls |>
+    pivot_longer(M1:M4, names_to = "model", values_to = "score") |>
+    group_by(model) |>
+    summarise(
+      pr_auc  = if (n_high > 0 && !all(is.na(score))) pr_auc_vec(truth, score)  else NA_real_,
+      roc_auc = if (n_high > 0 && !all(is.na(score))) roc_auc_vec(truth, score) else NA_real_,
+      .groups = "drop")
+
+  r_tab <- reg |>
+    pivot_longer(M1:M4, names_to = "model", values_to = "pred") |>
+    group_by(model) |>
+    summarise(MAE = mean(abs(pred - truth), na.rm = TRUE), .groups = "drop")
+
+  left_join(c_tab, r_tab, by = "model") |>
+    mutate(n_high = n_high, n_rows = nrow(cls))
+}
+
+variants <- list(
+  main          = \() build_analysis(pm_main, weather_daily, fire_main, T_HIGH),
+  threshold_alt = \() build_analysis(pm_main, weather_daily, fire_main, T_ALT),
+  modis         = \() build_analysis(pm_main, weather_daily,
+                                     build_fire_daily(modis_path, "modis"), T_HIGH),
+  keep_low_conf = \() build_analysis(pm_main, weather_daily,
+                                     build_fire_daily(viirs_path, "viirs", keep_low = TRUE), T_HIGH),
+  single_total  = \() build_analysis(pm_main, weather_daily,
+                                     build_fire_daily(viirs_path, "viirs", zones = FALSE), T_HIGH),
+  min_hours_12  = \() build_analysis(build_pm_daily(pm_long, 12), weather_daily, fire_main, T_HIGH)
+)
+
+sens <- imap_dfr(variants, \(build, name)
+  cached(name, run_cv(build())) |> mutate(variant = name))
+
+# Haze-year stress test: train on 2017-2023 except 2019, test on 2019 (breaks time order)
+haze_test <- cached("haze_2019", {
+  a <- variants$main()
+  fire_vars <<- str_subset(names(a), "^(n|frp)_")
+  d <- prep(a)
+  tr <- filter(d, year <= 2023, year != 2019); te <- filter(d, year == 2019)
+  summarise_variant(score_models(tr, te), score_reg(tr, te))
+})
+sens <- bind_rows(sens, mutate(haze_test, variant = "haze_2019_stress"))
+
+# Compact table: fire gain for each variant
+sens_table <- sens |>
+  select(variant, model, pr_auc, MAE, n_high) |>
+  pivot_wider(names_from = model, values_from = c(pr_auc, MAE)) |>
+  mutate(gain_pr_lasso = pr_auc_M2 - pr_auc_M1,
+         gain_pr_rf    = pr_auc_M4 - pr_auc_M3,
+         gain_mae_lasso = MAE_M1 - MAE_M2,      # positive = fire features reduce error
+         gain_mae_rf    = MAE_M3 - MAE_M4)
+saveRDS(sens_table, here("data_processed", "sensitivity_table.rds"))
+knitr::kable(select(sens_table, variant, n_high, starts_with("gain")), digits = 3)
+```
+
+## 2.3 Subgroup Measurement
+```{r}
+cv_preds <- readRDS(here("data_processed", "cv_preds.rds"))
+monsoon <- function(m) case_when(m %in% c(12, 1, 2, 3) ~ "NE", m %in% 6:9 ~ "SW",
+                                 TRUE ~ "inter")
+
+subgroup_cls <- function(p, group_var) {
+  p |>
+    mutate(monsoon = monsoon(month(date))) |>
+    pivot_longer(M1:M4, names_to = "model", values_to = "score") |>
+    group_by({{ group_var }}, model) |>
+    summarise(n_high  = sum(truth == "high"),
+              n       = n(),
+              pr_auc  = if (n_high > 0 && n_high < n) pr_auc_vec(truth, score) else NA_real_,
+              roc_auc = if (n_high > 0 && n_high < n) roc_auc_vec(truth, score) else NA_real_,
+              .groups = "drop") |>
+    pivot_wider(names_from = model, values_from = c(pr_auc, roc_auc))
+}
+
+subgroup_reg <- function(p, group_var) {
+  p |>
+    mutate(monsoon = monsoon(month(date))) |>
+    pivot_longer(B1:M4, names_to = "model", values_to = "pred") |>
+    group_by({{ group_var }}, model) |>
+    summarise(MAE = mean(abs(pred - truth)), n = n(), .groups = "drop") |>
+    pivot_wider(names_from = model, values_from = MAE)
+}
+
+cls_region  <- subgroup_cls(cv_preds, region)
+cls_monsoon <- subgroup_cls(cv_preds, monsoon)
+reg_region  <- subgroup_reg(reg_cv, region)
+reg_monsoon <- subgroup_reg(reg_cv, monsoon)
+
+walk(list(cls_region, cls_monsoon, reg_region, reg_monsoon),
+     \(t) print(knitr::kable(t, digits = 3)))
+
+# 2024 test, regression only (no high days for classification)
+reg_test_region <- subgroup_reg(reg_test, region)
+knitr::kable(reg_test_region, digits = 2)
+
+# Figure: MAE gain from fire features by region and season (CV)
+bind_rows(
+  reg_region  |> transmute(group = region,  type = "Region", lasso = M1 - M2, rf = M3 - M4),
+  reg_monsoon |> transmute(group = monsoon, type = "Monsoon season", lasso = M1 - M2, rf = M3 - M4)
+) |>
+  pivot_longer(c(lasso, rf), names_to = "model", values_to = "gain") |>
+  ggplot(aes(gain, group, fill = model)) +
+  geom_col(position = "dodge") +
+  geom_vline(xintercept = 0) +
+  facet_wrap(~ type, scales = "free_y") +
+  labs(x = "MAE reduction from fire features (µg/m³; positive = better)", y = NULL) +
+  theme_minimal()
+ggsave(here("figures", "fig_subgroup_gain.png"), width = 8, height = 4, dpi = 300)
+```
